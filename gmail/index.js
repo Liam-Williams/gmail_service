@@ -7,57 +7,40 @@ var google          = require('googleapis');
 var gmail           = google.gmail('v1');
 var GoogleOAuth2    = google.auth.OAuth2;
 
-var User            = require('../../models/user');
-var cryptoUtil      = require('../../utils/crypto-util');
-
 var valueInParenthesis = /<.*>/;
 var gmailDateFormat = 'ddd, DD MMM YYYY HH:mm:ss Z';
 
-var getGoogleOauthClient = exports.getGoogleOauthClient = function(user, gmailUser, googleClient, callback) {
+var getGoogleOauthClient = exports.getGoogleOauthClient = function(callback) {
 
-    var token = cryptoUtil.decrypt(gmailUser.accessToken);
-    var refreshToken = cryptoUtil.decrypt(gmailUser.refreshToken);
+    var token = process.env.GOOGLE_ACCESS_TOKEN;
+    var refreshToken = process.env.GOOGLE_ACCESS_TOKEN;
     var googleClient = new GoogleOAuth2(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET, process.env.GOOGLE_CALLBACK);
     googleClient.setCredentials({
       access_token: token,
       refresh_token: refreshToken
     });
 
-    if (new Date().getTime() > gmailUser.expires_at){
-        console.log('expired token attempting resfresh');
-        googleClient.refreshAccessToken(function(err, tokens) {
-            if (err) return callback(err);
-            var token = cryptoUtil.encrypt(tokens.access_token);
-            var refreshToken = cryptoUtil.encrypt(tokens.refresh_token);
-            var update = {'google.$.accessToken': token, 'google.$.refreshToken': refreshToken, 'google.$.expires_at': tokens.expiry_date};
-            User.findOneAndUpdate({_id: user._id, 'google.id': gmailUser.id}, {$set: update}, {new: true}, function(err, nMe){
-                callback(err, nMe, googleClient);
-            });
-        });
+    // if (new Date().getTime() > gmailUser.expires_at){
+    //     console.log('expired token attempting resfresh');
+    //     googleClient.refreshAccessToken(function(err, tokens) {
+    //         process.env.GOOGLE_ACCESS_TOKEN = tokens.access_token;
+    //         process.env.GOOGLE_REFRESH_TOKEN = tokens.refresh_token;
+    //     });
 
-    } else callback(null, null, googleClient);
+    // } else
+    callback(null, null, googleClient);
 }
 
 exports.getGmailMessages = function(req, res, next){
-    User.findOne({_id: req.user._id}, function(err, user){
-        if (err) { console.log(err); res.status(500).end(); };
-        if (!user) { console.log('Couldn\'t find me'); res.status(500).end(); }
-        if (!user.google) { console.log('No gmail on user'); res.status(500).end(); }
-        if (false && user.google.length) {
-            return getGmailMessagesSince(user, req, res, next);
-        } else {
-            return getGmailAllMessages(user, req, res, next);
-        }
-    });
+    getGmailAllMessages(req, res, next);
 }
 
-var getGmailAllMessages = exports.getGmailAllMessages = function(me, req, res, next) {
-    var guser = me.google[0];
+var getGmailAllMessages = exports.getGmailAllMessages = function(req, res, next) {
     var googleClient;
 
     async.parallel([
     function(callback){
-        getGoogleOauthClient(me, guser, googleClient, function(err, user, _googleClient){
+        getGoogleOauthClient(function(err, user, _googleClient){
             if (user) me = user;
             if (_googleClient) googleClient = _googleClient;
             callback(err);
@@ -65,7 +48,7 @@ var getGmailAllMessages = exports.getGmailAllMessages = function(me, req, res, n
     }], function(err){
         if (err) { console.log(err); return res.status(500).end(); }
         if (!googleClient) { console.log('no google OAuth Client'); return res.status(500).end(); }
-        gmail.users.messages.list({auth: googleClient, userId: guser.id}, function(err, messages){
+        gmail.users.messages.list({auth: googleClient, userId: 'me'}, function(err, messages){
             if (err) { console.log(err); return res.status(500).end() };
             //can do with batch request
             async.mapSeries(messages.messages.splice(0,10), function(message, callback){
@@ -73,62 +56,14 @@ var getGmailAllMessages = exports.getGmailAllMessages = function(me, req, res, n
             }, function(err, results){
                 if (err) { console.log(err); return res.status(500).end(); }
                 var topHistoryId = results[0].historyId;
-                User.update({_id: me._id, 'google.id': guser.id}, {$set: {'google.$.historyId': topHistoryId}}, function(err){
-                    if (err) console.log(err);
-                });
                 res.json({historyId: topHistoryId, messages: results});
             }); // end get all gmail messages
         }); // end list gmail messages
     }); // end async parallel
 } // end api call
 
-var getGmailMessagesSince = exports.getGmailMessagesSince = function(me, req, res, next) {
-
-    var guser = me.google[0];
-    var googleClient;
-
-    async.parallel([
-    function(callback){
-        getGoogleOauthClient(me, guser, googleClient, function(err, user, _googleClient){
-            if (user) me = user;
-            if (_googleClient) googleClient = _googleClient;
-            callback(err);
-        });
-    }], function(err){
-        if (err) { console.log(err); return res.status(500).end(); }
-        if (!googleClient) { console.log('no google OAuth Client'); return res.status(500).end(); }
-        gmail.users.history.list({auth: googleClient, userId: guser.id, startHistoryId: guser.historyId}, function(err, history){
-            if (err) { console.log(err); return res.status(500).end() };
-            //can do with batch request
-            //console.log(JSON.stringify(history, null, 3));
-            var results = [];
-            async.eachSeries(history.history.splice(0,10), function(history, callback){
-                async.eachSeries(history.messages, function(message, messageCallback){
-                    getGmailMessage(me, guser, googleClient, message.id, function(err, data){
-                        results.push(data);
-                        messageCallback(err);
-                    });
-                }, function(err){
-                    callback(err);
-                });
-
-            }, function(err){
-                if (err) { console.log(err); return res.status(500).end(); }
-                var topHistoryId = guser.historyId;
-                if (results.length){
-                    topHistoryId = results[0].historyId;
-                    User.update({_id: me._id, 'google.id': guser.id}, {$set: {'google.$.historyId': topHistoryId}}, function(err){
-                        if (err) console.log(err);
-                    });
-                }
-                res.json({historyId: topHistoryId, messages: results});
-            }); // end get all gmail messages
-        }); // end list gmail messages
-    }); // end async parallel
-} // end api call
-
-var getGmailMessage = exports.getGmailMessage = function(user, googleUser, googleOAuthClient, messageId, callback) {
-    gmail.users.messages.get({id: messageId, auth: googleOAuthClient, userId: googleUser.id}, function(err, message){
+var getGmailMessage = exports.getGmailMessage = function(googleOAuthClient, messageId, callback) {
+    gmail.users.messages.get({id: messageId, auth: googleOAuthClient, userId: 'me'}, function(err, message){
         if (err) callback(err);
         var headers = {};
         var tHeaders = message.payload.headers.filter(function(header){
@@ -202,7 +137,7 @@ var getGmailMessage = exports.getGmailMessage = function(user, googleUser, googl
         }
 
         headers.id = messageId;
-        headers.owner = user._id;
+        headers.owner = 'me';
         headers.historyId = message.historyId;
 
         if (message.payload.parts && message.payload.parts[0].parts){
